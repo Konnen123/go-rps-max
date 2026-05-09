@@ -1,0 +1,25 @@
+services:
+    app:
+        build:
+          context: .
+          dockerfile: Dockerfile
+        ports:
+        - "8080:8080"
+        # Load environment variables from a local .env file to avoid placing secrets directly
+        # in this compose file. Keep NODE_ENV with a safe default using variable substitution.
+        env_file:
+        - .env-prod
+        depends_on:
+        - redis
+        extra_hosts:
+          - "host.docker.internal:host-gateway"
+    redis:
+        image: redis:latest
+        ports:
+        - "6379:6379"
+        healthcheck:
+          test: ["CMD", "redis-cli", "ping"]
+          interval: 10s
+          timeout: 5s
+          retries: 5
+        command: ["redis-server", "--bind", "0.0.0.0"]
