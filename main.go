@@ -235,6 +235,10 @@ func main() {
 		log.Printf("Warning: Error loading locations into Redis: %v", err)
 	}
 
+	// Start the background consumer for processing locations from the Redis stream
+	log.Println("Starting Redis stream consumer for locations...")
+	startLocationConsumer(db, redisCache)
+
 	defer func() { _ = db.Close() }()
 
 	aMux.HandleHttpFunc(http.MethodGet, "/api/health", func(w http.ResponseWriter, r *http.Request) {
@@ -349,7 +353,7 @@ func main() {
 		})
 	})
 
-	// Keyset pagination with Redis as DB
+	// Keyset pagination with Redis cache
 	aMux.HandleHttpFunc(http.MethodGet, "/api/v4/locations", func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.Background()
 		lastId := r.URL.Query().Get("last_id")
@@ -436,6 +440,111 @@ func main() {
 			Locations    []Location         `json:"locations"`
 			NextLocation NextLocationCursor `json:"next_location_cursor"`
 		}{Locations: locations, NextLocation: next})
+	})
+
+	// Write method (DB first, then update Redis cache) - kept for backward compatibility
+	aMux.HandleHttpFunc(http.MethodPost, "/api/v1/locations", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			City      string `json:"city"`
+			Country   string `json:"country"`
+			Iso       string `json:"iso"`
+			Latitude  string `json:"latitude"`
+			Longitude string `json:"longitude"`
+			Address   string `json:"address"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+			return
+		}
+
+		query := "INSERT INTO locations (city, country, iso, latitude, longitude, address) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at"
+		var id, createdAt string
+		err := db.QueryRow(query, req.City, req.Country, req.Iso, req.Latitude, req.Longitude, req.Address).Scan(&id, &createdAt)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+			return
+		}
+
+		// Insert into Redis cache
+		ctx := context.Background()
+		// Get current max score to assign a new score that is higher (more recent)
+		scoreCmd := redisCache.client.ZScore(ctx, redisLocationsZKey, id)
+		var newScore float64
+		if err := scoreCmd.Err(); err != nil {
+			if err == redis.Nil {
+				// No existing score, assign a new one based on current time
+				newScore = float64(time.Now().UnixNano())
+			} else {
+				log.Printf("Error getting score for new location: %v", err)
+				newScore = float64(time.Now().UnixNano())
+			}
+		} else {
+			newScore = scoreCmd.Val() + 1
+		}
+
+		pipe := redisCache.client.Pipeline()
+		pipe.ZAdd(ctx, redisLocationsZKey, redis.Z{Score: newScore, Member: id})
+		locKey := "location:" + id
+		pipe.HSet(ctx, locKey, map[string]interface{}{
+			"id":         id,
+			"city":       req.City,
+			"country":    req.Country,
+			"created_at": createdAt,
+		})
+		if _, err := pipe.Exec(ctx); err != nil {
+			log.Printf("Error updating Redis cache for new location: %v", err)
+		}
+
+		writeJSON(w, http.StatusCreated, struct {
+			Id        string `json:"id"`
+			CreatedAt string `json:"created_at"`
+		}{
+			Id:        id,
+			CreatedAt: createdAt,
+		})
+	})
+
+	// Write method v2 => store into a queue (e.g. Redis Stream) and have a background worker consume from the queue, write to DB, then update cache.
+	aMux.HandleHttpFunc(http.MethodPost, "/api/v2/locations", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			City      string `json:"city"`
+			Country   string `json:"country"`
+			Iso       string `json:"iso"`
+			Latitude  string `json:"latitude"`
+			Longitude string `json:"longitude"`
+			Address   string `json:"address"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+			return
+		}
+
+		// Add to Redis Stream for processing
+		ctx := context.Background()
+		streamKey := "locations:stream"
+		args := &redis.XAddArgs{
+			Stream: streamKey,
+			Values: map[string]interface{}{
+				"city":      req.City,
+				"country":   req.Country,
+				"iso":       req.Iso,
+				"latitude":  req.Latitude,
+				"longitude": req.Longitude,
+				"address":   req.Address,
+			},
+		}
+		id, err := redisCache.client.XAdd(ctx, args).Result()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+		}
+
+		log.Println("New location added to stream with ID:", id)
+		writeJSON(w, http.StatusAccepted, struct {
+			Id string `json:"id"`
+		}{
+			Id: id,
+		})
 	})
 
 	log.Println("Starting server on :8080")
