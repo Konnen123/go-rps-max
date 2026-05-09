@@ -107,8 +107,6 @@ func newRedisClient(cfg redisConfig) (*redisClient, error) {
 		DB:       cfg.db,
 	})
 
-	defer func() { _ = rdb.Close() }()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -394,20 +392,30 @@ func main() {
 		ids := membersCmd.Val()
 
 		var locations []Location
-		for _, id := range ids {
-			hcmd := redisCache.client.HGetAll(ctx, "location:"+id)
-			if err := hcmd.Err(); err != nil {
+		if len(ids) > 0 {
+			// Batch all HGETALL commands in a pipeline to avoid N+1 problem
+			pipe := redisCache.client.Pipeline()
+			cmds := make([]*redis.MapStringStringCmd, len(ids))
+			for i, id := range ids {
+				cmds[i] = pipe.HGetAll(ctx, "location:"+id)
+			}
+			_, err := pipe.Exec(ctx)
+			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
 				return
 			}
-			data := hcmd.Val()
-			loc := Location{
-				Id:        data["id"],
-				City:      data["city"],
-				Country:   data["country"],
-				CreatedAt: data["created_at"],
+
+			// Collect results from pipelined commands
+			for _, cmd := range cmds {
+				data := cmd.Val()
+				loc := Location{
+					Id:        data["id"],
+					City:      data["city"],
+					Country:   data["country"],
+					CreatedAt: data["created_at"],
+				}
+				locations = append(locations, loc)
 			}
-			locations = append(locations, loc)
 		}
 
 		if len(locations) == 0 {
